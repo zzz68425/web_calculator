@@ -36,6 +36,14 @@ class Config:
     # API Keys
     SHODAN_API_KEY: str = os.getenv('SHODAN_API_KEY', '')
     OTX_API_KEY: str = os.getenv('OTX_API_KEY', '')
+    MERKLEMAP_API_TOKEN: str = os.getenv('MERKLEMAP_API_TOKEN', '')
+
+    # 憑證透明度資料來源
+    CT_PROVIDER: str = os.getenv('CT_PROVIDER', 'crtsh').strip().lower()
+    MERKLEMAP_REQUEST_DELAY: float = float(os.getenv('MERKLEMAP_REQUEST_DELAY', '0.25'))
+    MERKLEMAP_MAX_RETRIES: int = int(os.getenv('MERKLEMAP_MAX_RETRIES', '3'))
+    # 0 表示完整讀取所有分頁
+    MERKLEMAP_MAX_PAGES: int = int(os.getenv('MERKLEMAP_MAX_PAGES', '0'))
 
     # 舊的單一 VT 變數（向下相容）
     VIRUSTOTAL_API_KEY: str = os.getenv('VIRUSTOTAL_API_KEY', '')
@@ -94,5 +102,13 @@ class Config:
             raise ValueError("SHODAN_API_KEY 未設定")
         if not self.VIRUSTOTAL_API_KEYS:
             raise ValueError("VIRUSTOTAL_API_KEY 或 VIRUSTOTAL_API_KEYS 未設定")
+        if self.CT_PROVIDER not in {"crtsh", "merklemap"}:
+            raise ValueError("CT_PROVIDER 必須是 crtsh 或 merklemap")
+        if self.CT_PROVIDER == "merklemap" and not self.MERKLEMAP_API_TOKEN:
+            raise ValueError("CT_PROVIDER=merklemap 時必須設定 MERKLEMAP_API_TOKEN")
+        if self.MERKLEMAP_MAX_RETRIES < 1:
+            raise ValueError("MERKLEMAP_MAX_RETRIES 必須大於等於 1")
+        if self.MERKLEMAP_MAX_PAGES < 0:
+            raise ValueError("MERKLEMAP_MAX_PAGES 不可小於 0")
         # OTX 可選，允許空
         return True

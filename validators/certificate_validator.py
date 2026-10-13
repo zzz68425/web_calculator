@@ -1,56 +1,60 @@
 # validators/certificate_validator.py
 """
-憑證驗證器 - 使用 crt.sh API 檢查主機的 SSL 憑證
+憑證驗證器 - 使用可替換的 CT provider 檢查主機的 SSL 憑證
 改進版：批量查詢 root domain 憑證，減少 API 呼叫
 """
-import sys
-import json
-from typing import List, Optional, Set, Dict
+from dataclasses import dataclass, field
+from typing import Dict, List, Set
 from datetime import datetime
 import time
 import random
 
-import requests
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
-from sqlalchemy import select, update
+from sqlalchemy import column, select, table, update
 
 from database.session import create_session_factory, db_session
 from database.models import Domain
 from config import Config
+from scanners.certificate_transparency import (
+    CertificateLookupError,
+    CertificateTransparencyProvider,
+)
+from scanners.crtsh_scanner import CrtshScanner
 from utils.logger import get_logger
 
 logger = get_logger("validators.certificate_validator")
 
 
-class CertificateValidator:
-    """使用 crt.sh API 驗證主機憑證的驗證器（批量模式）"""
+@dataclass
+class CertificateValidationResult:
+    """Keep missing certificates separate from failed requests or writes."""
 
-    def __init__(self, timeout: int = 30, base_delay: float = 2.0):
+    checked_count: int = 0
+    updated_count: int = 0
+    no_certificate_count: int = 0
+    failures: dict[str, str] = field(default_factory=dict)
+    checked_hostnames: set[str] = field(default_factory=set)
+
+
+class CertificateValidator:
+    """使用 CT provider 驗證主機憑證的驗證器（批量模式）。"""
+
+    def __init__(
+        self,
+        timeout: int = 30,
+        base_delay: float = 2.0,
+        provider: CertificateTransparencyProvider | None = None,
+        database_path: str | None = None,
+    ):
         self.timeout = timeout
         self.base_delay = base_delay
-        
-        # 設定 session 與重試策略
-        self.session = requests.Session()
-        retry_strategy = Retry(
-            total=3,
-            backoff_factor=2,
-            status_forcelist=[429, 502, 503, 504],
-            allowed_methods=["GET"]
-        )
-        adapter = HTTPAdapter(max_retries=retry_strategy)
-        self.session.mount("http://", adapter)
-        self.session.mount("https://", adapter)
-        
-        self.session.headers.update({
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/58.0.3029.110 Safari/537.36"
-            )
-        })
+        self.provider = provider or CrtshScanner(timeout_read=float(timeout))
+        self.database_path = database_path or Config.DATABASE_PATH
 
-    def _fetch_domain_certificates(self, root_domain: str) -> Set[str]:
+    def _fetch_domain_certificates(
+        self,
+        root_domain: str,
+        hostnames: List[str] | None = None,
+    ) -> Set[str]:
         """
         獲取指定 root domain 的所有憑證名稱
         
@@ -60,39 +64,99 @@ class CertificateValidator:
         Returns:
             包含所有憑證名稱的 set
         """
-        url = f"https://crt.sh/json?cn={root_domain}&exclude=expired"
-        
         try:
-            logger.info(f"查詢 {root_domain} 的憑證資料...")
-            resp = self.session.get(url, timeout=self.timeout)
-            resp.raise_for_status()
-            
-            data = resp.json()
-            cert_names: Set[str] = set()
-            
-            for record in data:
-                name_value = record.get("name_value")
-                if not name_value:
-                    continue
-                
-                # name_value 可能是多行（以 \n 分隔），每行是一個名稱
-                for part in str(name_value).split("\n"):
-                    name = part.strip()
-                    if name:
-                        cert_names.add(name)
-            
-            logger.info(f"從 {root_domain} 取得 {len(cert_names)} 個憑證名稱")
-            return cert_names
-            
-        except requests.exceptions.RequestException as e:
-            logger.warning(f"查詢 {root_domain} 憑證失敗: {e}")
-            return set()
-        except json.JSONDecodeError as e:
-            logger.warning(f"憑證 API 回應解析失敗 {root_domain}: {e}")
-            return set()
+            logger.info(
+                f"[{self.provider.provider_name}] 查詢 {root_domain} 的有效憑證資料..."
+            )
+            return self.provider.get_active_certificate_names(root_domain, hostnames)
         except Exception as e:
-            logger.error(f"查詢 {root_domain} 憑證時發生未預期錯誤: {e}")
-            return set()
+            logger.error(
+                f"[{self.provider.provider_name}] 查詢 {root_domain} 憑證時"
+                f"發生未預期錯誤: {e}"
+            )
+            raise
+
+    def validate_root_domain(
+        self,
+        root_domain: str,
+        hostnames: List[str],
+    ) -> CertificateValidationResult:
+        """Validate only this batch, using its explicit storage root."""
+        root = root_domain.strip().lower().rstrip(".")
+        hosts = sorted({
+            host.strip().lower().rstrip(".") for host in hostnames if host.strip()
+        })
+        if not root or any(
+            host != root and not host.endswith("." + root) for host in hosts
+        ):
+            raise ValueError("憑證驗證清單必須屬於指定的 root domain")
+
+        result = CertificateValidationResult()
+        if not hosts:
+            return result
+
+        engine, session_factory = create_session_factory(self.database_path)
+        try:
+            # Use only requested FQDNs, not every hierarchy node in the database.
+            fqdn_view = table("fqdn", column("id"), column("name"))
+            domain_ids: dict[str, int] = {}
+            with db_session(session_factory) as session:
+                for start in range(0, len(hosts), 400):
+                    names = [host + "." for host in hosts[start : start + 400]]
+                    rows = session.execute(
+                        select(fqdn_view.c.id, fqdn_view.c.name)
+                        .where(fqdn_view.c.name.in_(names))
+                    ).all()
+                    domain_ids.update(
+                        (name.rstrip("."), domain_id) for domain_id, name in rows
+                    )
+
+            for host in hosts:
+                if host not in domain_ids:
+                    result.failures[host] = "找不到域名記錄，無法完成憑證驗證"
+            candidates = [host for host in hosts if host in domain_ids]
+            if not candidates:
+                return result
+
+            try:
+                cert_names = self._fetch_domain_certificates(root, candidates)
+            except CertificateLookupError as exc:
+                cert_names = exc.active_names
+                failures = exc.failed_hostnames or {host: str(exc) for host in candidates}
+                result.failures.update(
+                    (host, reason) for host, reason in failures.items() if host in domain_ids
+                )
+            except Exception as exc:
+                result.failures.update((host, str(exc)) for host in candidates)
+                return result
+
+            for host in candidates:
+                if host in result.failures:
+                    continue
+                result.checked_count += 1
+                wildcard = "*." + host.split(".", 1)[1] if "." in host else ""
+                if host not in cert_names and wildcard not in cert_names:
+                    result.no_certificate_count += 1
+                    result.checked_hostnames.add(host)
+                    continue
+
+                try:
+                    with db_session(session_factory) as session:
+                        updated = session.execute(
+                            update(Domain)
+                            .where(Domain.id == domain_ids[host])
+                            .values(when_latest_certificate_checked=datetime.now())
+                        )
+                        if updated.rowcount != 1:
+                            raise RuntimeError("找不到域名記錄，憑證檢查時間更新失敗")
+                    result.updated_count += 1
+                    result.checked_hostnames.add(host)
+                except Exception as exc:
+                    result.failures[host] = str(exc)
+            return result
+        finally:
+            session_factory.remove()
+            engine.dispose()
 
     def _update_certificate_check_time(self, domain_id: int, hostname: str) -> bool:
         """
@@ -106,7 +170,7 @@ class CertificateValidator:
             True 如果更新成功，False 則否
         """
         try:
-            engine, SessionFactory = create_session_factory(Config.DATABASE_PATH)
+            engine, SessionFactory = create_session_factory(self.database_path)
             with db_session(SessionFactory) as session:
                 current_time = datetime.now()
                 result = session.execute(
@@ -133,7 +197,7 @@ class CertificateValidator:
         Returns:
             {root_domain: [(id, fqdn), ...]} 的字典
         """
-        engine, SessionFactory = create_session_factory(Config.DATABASE_PATH)
+        engine, SessionFactory = create_session_factory(self.database_path)
         
         with db_session(SessionFactory) as session:
             from database.models import RootDomain
@@ -196,7 +260,10 @@ class CertificateValidator:
             logger.info(f"處理 {root_domain}，包含 {len(domains)} 個主機...")
             
             # 獲取該 root domain 的所有憑證名稱
-            cert_names = self._fetch_domain_certificates(root_domain)
+            cert_names = self._fetch_domain_certificates(
+                root_domain,
+                [hostname for _, hostname in domains],
+            )
             
             if not cert_names:
                 logger.warning(f"無法取得 {root_domain} 的憑證資料，跳過...")
@@ -275,13 +342,13 @@ class CertificateValidator:
         
         # 需要 DatabaseManagerORM 來查找 domain_id
         from database.repository import DatabaseManagerORM
-        db_manager = DatabaseManagerORM(Config.DATABASE_PATH)
+        db_manager = DatabaseManagerORM(self.database_path)
         
         for root_domain, hosts in domain_hosts.items():
             logger.info(f"查詢 {root_domain} 的憑證...")
             
             # 獲取該 root domain 的所有憑證名稱
-            cert_names = self._fetch_domain_certificates(root_domain)
+            cert_names = self._fetch_domain_certificates(root_domain, hosts)
             
             if not cert_names:
                 logger.warning(f"無法取得 {root_domain} 的憑證資料")

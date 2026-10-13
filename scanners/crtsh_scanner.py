@@ -7,21 +7,24 @@ from __future__ import annotations
 
 import random
 import time
+from collections.abc import Iterable
 from typing import List, Set
 
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
+from scanners.certificate_transparency import CertificateLookupError
 from utils.logger import get_logger
 
 logger = get_logger("scanners.crtsh_scanner")
 
 
 class CrtshScanner:
-    """使用 crt.sh 取得子網域清單（name_value 來源）。"""
+    """使用 crt.sh 取得子網域與有效憑證名稱。"""
 
     BASE_URL = "https://crt.sh/json"
+    provider_name = "crt.sh"
 
     def __init__(
         self,
@@ -69,7 +72,51 @@ class CrtshScanner:
         if not root:
             return []
 
-        params = {"q": f"%.{root}", "output": "json"}
+        records = self._fetch_records(
+            root,
+            params={"q": f"%.{root}", "output": "json"},
+            operation="子網域查詢",
+        )
+        if records is None:
+            return []
+
+        subdomains = self._extract_from_name_value(records, root)
+        logger.info(
+            f"[crt.sh] {root} 原始 {len(records)} 筆，去重後 {len(subdomains)} 個子網域"
+        )
+        return subdomains
+
+    def get_active_certificate_names(
+        self,
+        root_domain: str,
+        hostnames: Iterable[str] | None = None,
+    ) -> Set[str]:
+        """取得 root domain 目前未過期憑證涵蓋的 DNS 名稱。"""
+        root = (root_domain or "").strip().lower().rstrip(".")
+        if not root:
+            return set()
+
+        records = self._fetch_records(
+            root,
+            params={"cn": root, "exclude": "expired"},
+            operation="有效憑證查詢",
+        )
+        if records is None:
+            raise CertificateLookupError(f"[crt.sh] {root} 有效憑證查詢失敗")
+
+        certificate_names = self._extract_certificate_names(records)
+        logger.info(
+            f"[crt.sh] {root} 取得 {len(certificate_names)} 個有效憑證名稱"
+        )
+        return certificate_names
+
+    def _fetch_records(
+        self,
+        root_domain: str,
+        params: dict[str, str],
+        operation: str,
+    ) -> list[dict] | None:
+        """執行 crt.sh JSON 查詢，集中處理重試與錯誤。"""
 
         for attempt in range(1, self.max_retries + 1):
             try:
@@ -82,45 +129,52 @@ class CrtshScanner:
                 data = resp.json()
 
                 if not isinstance(data, list):
-                    logger.warning(f"[crt.sh] {root} 回傳格式非 list，忽略")
-                    return []
-
-                subdomains = self._extract_from_name_value(data, root)
-                logger.info(
-                    f"[crt.sh] {root} 原始 {len(data)} 筆，去重後 {len(subdomains)} 個子網域"
-                )
-                return subdomains
+                    logger.warning(
+                        f"[crt.sh] {root_domain} {operation}回傳格式非 list，忽略"
+                    )
+                    return None
+                return data
 
             except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
                 if attempt >= self.max_retries:
-                    logger.warning(f"[crt.sh] {root} 連線/逾時最終失敗: {e}")
-                    return []
+                    logger.warning(
+                        f"[crt.sh] {root_domain} {operation}連線/逾時最終失敗: {e}"
+                    )
+                    return None
                 delay = self._backoff_delay(attempt)
                 logger.warning(
-                    f"[crt.sh] {root} 連線/逾時失敗 (attempt {attempt}/{self.max_retries})，{delay:.2f}s 後重試: {e}"
+                    f"[crt.sh] {root_domain} {operation}連線/逾時失敗 "
+                    f"(attempt {attempt}/{self.max_retries})，{delay:.2f}s 後重試: {e}"
                 )
                 time.sleep(delay)
 
             except requests.exceptions.RequestException as e:
                 if attempt >= self.max_retries:
-                    logger.warning(f"[crt.sh] {root} HTTP 請求最終失敗: {e}")
-                    return []
+                    logger.warning(
+                        f"[crt.sh] {root_domain} {operation} HTTP 請求最終失敗: {e}"
+                    )
+                    return None
                 delay = self._backoff_delay(attempt)
                 logger.warning(
-                    f"[crt.sh] {root} HTTP 請求失敗 (attempt {attempt}/{self.max_retries})，{delay:.2f}s 後重試: {e}"
+                    f"[crt.sh] {root_domain} {operation} HTTP 請求失敗 "
+                    f"(attempt {attempt}/{self.max_retries})，{delay:.2f}s 後重試: {e}"
                 )
                 time.sleep(delay)
 
             except ValueError as e:
                 # JSON 解析錯誤
-                logger.warning(f"[crt.sh] {root} JSON 解析失敗: {e}")
-                return []
+                logger.warning(
+                    f"[crt.sh] {root_domain} {operation} JSON 解析失敗: {e}"
+                )
+                return None
 
             except Exception as e:
-                logger.warning(f"[crt.sh] {root} 發生未預期錯誤: {e}")
-                return []
+                logger.warning(
+                    f"[crt.sh] {root_domain} {operation}發生未預期錯誤: {e}"
+                )
+                return None
 
-        return []
+        return None
 
     def _extract_from_name_value(self, records: list[dict], root_domain: str) -> List[str]:
         """從 crt.sh records 的 name_value 欄位擷取並去重。"""
@@ -145,6 +199,20 @@ class CrtshScanner:
                     out.add(fqdn)
 
         return sorted(out)
+
+    @staticmethod
+    def _extract_certificate_names(records: list[dict]) -> Set[str]:
+        """從 name_value 擷取憑證名稱，保留 wildcard 供驗證使用。"""
+        names: Set[str] = set()
+        for record in records:
+            raw = (record or {}).get("name_value")
+            if not raw:
+                continue
+            for part in str(raw).splitlines():
+                name = part.strip().lower().rstrip(".")
+                if name:
+                    names.add(name)
+        return names
 
     def _backoff_delay(self, attempt: int) -> float:
         # exponential backoff + jitter
